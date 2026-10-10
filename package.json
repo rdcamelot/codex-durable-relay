@@ -1,0 +1,9 @@
+{
+  "name": "codex-durable-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Experimental Windows loopback relay for one Codex cloud endpoint through a local HTTP proxy.",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test tests/*.test.cjs" }
+}

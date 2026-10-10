@@ -1,0 +1,40 @@
+name: Windows checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Node ${{ matrix.node-version }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Run isolated tests and build check
+        shell: powershell
+        run: >-
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+          -File "$PWD\scripts\Test.ps1";
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check public files
+        shell: powershell
+        run: >-
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+          -File "$PWD\scripts\Check-PublicFiles.ps1";
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
