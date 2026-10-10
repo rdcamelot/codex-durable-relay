@@ -152,6 +152,6 @@
 
 ## 许可证与实现声明
 
-当前候选许可证为 MIT，详见 [`LICENSE`](LICENSE)。本项目实现使用 Node.js 内置
+本项目采用 MIT 许可证，详见 [`LICENSE`](LICENSE)。本项目实现使用 Node.js 内置
 模块和 .NET/Windows API，没有引入 Proxifier 等项目代码。安全边界和报告方式见
 [`SECURITY.md`](SECURITY.md)。
