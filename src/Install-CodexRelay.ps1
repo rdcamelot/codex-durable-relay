@@ -26,7 +26,7 @@ $hasher = [Security.Cryptography.SHA256]::Create()
 try { $observedManifestHash = [BitConverter]::ToString($hasher.ComputeHash($manifestBytes)).Replace('-','') } finally { $hasher.Dispose() }
 if ($observedManifestHash -ne $ManifestHash) { throw 'The reviewed manifest changed.' }
 $manifest = [Text.Encoding]::UTF8.GetString($manifestBytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
-$allowedFiles = @('codex-durable-relay.cjs','relay-log.cjs','managed-relay.cjs','managed-relay-hosts.ps1','managed-hosts-lib.ps1','Launch-ManagedRelay.ps1','Manage-CodexRelay.ps1','Shutdown-CodexRelay.ps1','CodexRelayLifecycle.exe','CodexRelayLifecycle.cs')
+$allowedFiles = @('codex-durable-relay.cjs','relay-log.cjs','managed-relay.cjs','managed-relay-hosts.ps1','managed-hosts-lib.ps1','Launch-ManagedRelay.ps1','Manage-CodexRelay.ps1','Shutdown-CodexRelay.ps1','CodexRelayLifecycle.exe','CodexRelayLifecycle.cs','RelaySessionGuard.cs','RelaySessionGuard.dll','CodexRelayTrayHost.cs','CodexRelayTrayHost.exe','CodexRelayTrayHost.exe.config')
 if (@($manifest.files).Count -ne $allowedFiles.Count) { throw 'Unexpected payload count.' }
 foreach ($file in $allowedFiles) {
     $entry = @($manifest.files | Where-Object name -eq $file)
@@ -84,7 +84,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $installRoot 'settings.json'), $settingsJson, (New-Object Text.UTF8Encoding($false)))
     $payloadVerified = $true
     $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $userAction = New-ScheduledTaskAction -Execute $powerShellPath -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -File "' + (Join-Path $installRoot 'Launch-ManagedRelay.ps1') + '"') -WorkingDirectory $installRoot
+    $userAction = New-ScheduledTaskAction -Execute (Join-Path $installRoot 'CodexRelayTrayHost.exe') -WorkingDirectory $installRoot
     $userTrigger = New-ScheduledTaskTrigger -AtLogOn -User $OwnerName
     $userPrincipal = New-ScheduledTaskPrincipal -UserId $OwnerSid -LogonType Interactive -RunLevel Limited
     # The launcher owns the retry budget; scheduler retries would multiply it.

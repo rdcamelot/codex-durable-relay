@@ -41,7 +41,8 @@ helper/lifecycle 状态和 hosts 备份。按以下顺序收集信息：
 
 1. 用绑定的普通用户运行 `scripts\Control.ps1 -Action Status -AsJson`。
    部分卸载已经移除任务时，Status 可能无法完整查询；这不阻止重复执行卸载。
-2. 记录高层 `status`、`reason`、`lifecycleService` 和 helper 状态；不要复制
+2. 记录高层 `status`、`reason`、`lifecycleService`、`sessionGuardAlive`、
+   `cleanupHealth` 和 helper 状态；不要复制
    原始日志或完整 settings 到 issue。
 3. 确认 `Codex Durable Relay - User`、`Codex Durable Relay - Hosts` 和
    `CodexDurableRelayLifecycle` 的状态，不要直接删除任务/服务绕过清理。
@@ -61,7 +62,32 @@ helper/lifecycle 状态和 hosts 备份。按以下顺序收集信息：
 
 仓库的自动化测试使用隔离目录、fixture 和随机本地端口，设计目标是验证 relay、
 代理握手、日志轮转、hosts 字节保留、helper 和 lifecycle 脚本逻辑，不修改真实
-系统 hosts、任务或服务。作者机器只做过一次真实的 service `STOP` 验证。
+系统 hosts、任务或服务。作者机器验证过前身的真实 service `STOP`；托盘版既有
+安装已验证无终端窗口、取消通知不误停，以及普通用户通过控制入口停止后整个进程链、
+监听和映射均消失并能恢复运行。该验收没有实际关闭电脑或点击托盘菜单，不能代替
+真实电源循环或干净系统全新安装验证。
 
-真实关机、断电、注销竞态和 Windows 快速启动在当前证据中没有测试，不能在发行
-说明或 issue 中声称这些路径已验证。
+后续一次真实使用已确认：关机前通过托盘退出，清理成功后关机，下次快速启动能自动恢复，
+新运行正确关联上次退出回执。这不等于未手动退出托盘时的自动关机清理也已通过。
+
+真实快速启动验证先后暴露了服务异步清理过晚、PowerShell 退出窗口缺少新回执的问题。
+本版本把用户
+退出清理放在普通用户托盘宿主的顶层窗口中：及时同意 `WM_QUERYENDSESSION`，
+在确认的 `WM_ENDSESSION` 内等待清理完成，取消则保持运行。等待上限约 12 秒，
+Windows 或用户仍可以强制终止。SYSTEM 服务不再在注销后重复发起后台清理。
+实现参考 Microsoft 的 [WM_ENDSESSION](https://learn.microsoft.com/en-us/windows/win32/shutdown/wm-endsession)
+及[隐藏应用的关机处理建议](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/mpc/application-shutdown-changes-in-windows-vista)。
+
+托盘以 `UseShellExecute=false` 和 `CreateNoWindow=true` 启动固定 PowerShell
+子进程；启动器用相同无控制台方式运行 Node。登录触发、等待代理和普通用户权限
+不变。右键“停止并退出”会先停止后台、清除自有映射；未确认清理则保留托盘供重试。
+参考 [.NET 的 CreateNoWindow](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.processstartinfo.createnowindow)
+与 [NotifyIcon](https://learn.microsoft.com/en-us/dotnet/desktop/winforms/controls/notifyicon-component-overview-windows-forms)。
+
+`lastSessionCleanup` 保存用户退出处理的阶段、运行标识和触发来源；`previousExit`
+在新启动时关联上次运行与回执，缺失匹配则显示未确认。`session-notification.json`
+记录最近查询、取消或确认结束通知，便于区分通知未到达与清理失败。`lastLifecycleOperation`
+保存服务最近一次停止结果，启动不覆盖它。`cleanupHealth` 优先核对当前及上次运行
+标识；旧服务成功记录不能覆盖缺失的退出回执，较新的服务失败仍会提示。
+用户目录中的回执用于诊断，属于同一用户的信任范围，不能作为特权操作授权。
+尚不能把定向消息测试称为修复后的真实快速启动、强制关机、断电或多用户竞态验收。

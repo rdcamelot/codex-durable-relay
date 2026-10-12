@@ -29,12 +29,12 @@ try {
     $script:Issues = @()
     $allowedRootNames = @('README.md', 'SECURITY.md', 'LICENSE', '.gitignore', '.gitattributes')
     $allowedSourceNames = @(
-        'codex-durable-relay.cjs', 'CodexRelayLifecycle.cs', 'Install-CodexRelay.ps1',
+        'codex-durable-relay.cjs', 'CodexRelayLifecycle.cs', 'RelaySessionGuard.cs', 'CodexRelayTrayHost.cs', 'CodexRelayTrayHost.manifest', 'CodexRelayTrayHost.exe.config', 'Install-CodexRelay.ps1',
         'Launch-ManagedRelay.ps1', 'Manage-CodexRelay.ps1', 'managed-hosts-lib.ps1',
         'managed-relay-hosts.ps1', 'managed-relay.cjs', 'relay-log.cjs', 'Shutdown-CodexRelay.ps1'
     )
     $allowedScriptNames = @('Build.ps1', 'Check-PublicFiles.ps1', 'Control.ps1', 'Install.ps1', 'Test.ps1')
-    $allowedTestNames = @('install-transaction.test.ps1','uninstall-transaction.test.ps1','helper-parent.test.ps1','lifecycle-cleanup.test.ps1','managed-helper-entry.test.ps1','managed-hosts.test.ps1','managed-status.test.ps1','managed-relay.test.cjs','proxy-settings.test.cjs','relay-log.test.cjs','relay-validation.test.cjs','relay.test.cjs')
+    $allowedTestNames = @('session-guard.test.ps1','tray-host.test.ps1','install-transaction.test.ps1','uninstall-transaction.test.ps1','helper-parent.test.ps1','lifecycle-cleanup.test.ps1','managed-helper-entry.test.ps1','managed-hosts.test.ps1','managed-status.test.ps1','managed-relay.test.cjs','proxy-settings.test.cjs','relay-log.test.cjs','relay-validation.test.cjs','relay.test.cjs')
     $excludedDirectoryNames = @('.git', 'dist', 'build')
     $forbiddenExtensions = @('.exe', '.dll', '.pdb', '.log', '.jsonl', '.bin', '.tmp', '.flag', '.backup', '.bak', '.dmp', '.sqlite', '.sqlite3', '.db', '.zip')
     $forbiddenNames = @('settings.json', 'status.json', 'stop.json')
@@ -145,7 +145,14 @@ try {
         if ($content -match $literalSessionPattern) {
             Add-Issue -Path $relative -Category 'literal_session_id'
         }
-        if ($content -match $literalUuidPattern) {
+        # Only this public Windows compatibility declaration is exempted.
+        # Keep scanning all other manifest content for private identifiers.
+        $uuidContent = $content
+        if ($relative -eq 'src/CodexRelayTrayHost.manifest') {
+            $windowsCompatibilityId = '8e0f7a12' + '-bfb3-4fe8-b9a5-' + '48fd50a15a9a'
+            $uuidContent = $uuidContent.Replace('<supportedOS Id="{' + $windowsCompatibilityId + '}" />', '')
+        }
+        if ($uuidContent -match $literalUuidPattern) {
             Add-Issue -Path $relative -Category 'literal_uuid'
         }
         if ($content -match $literalThreadIdPattern) {

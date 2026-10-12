@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -21,14 +20,12 @@ internal static class CodexRelayLifecycle {
     private const int ChildTimeoutMilliseconds = 20000;
     private const int ScriptGateWaitMilliseconds = 21000;
     private const int StopWaitHintMilliseconds = 45000;
-    private const int MaxPendingLogoffs = 64;
     private const uint SERVICE_START_PENDING = 2, SERVICE_STOP_PENDING = 3, SERVICE_RUNNING = 4, SERVICE_STOPPED = 1;
     private const uint SERVICE_WIN32_OWN_PROCESS = 0x00000010;
-    private const uint SERVICE_ACCEPT_STOP = 0x00000001, SERVICE_ACCEPT_SHUTDOWN = 0x00000004, SERVICE_ACCEPT_SESSIONCHANGE = 0x00000080, SERVICE_ACCEPT_PRESHUTDOWN = 0x00000100;
-    private const uint SERVICE_CONTROL_STOP = 1, SERVICE_CONTROL_SHUTDOWN = 5, SERVICE_CONTROL_SESSIONCHANGE = 14, SERVICE_CONTROL_PRESHUTDOWN = 15;
-    private const uint WTS_SESSION_LOGOFF = 6;
+    private const uint SERVICE_ACCEPT_STOP = 0x00000001, SERVICE_ACCEPT_SHUTDOWN = 0x00000004, SERVICE_ACCEPT_PRESHUTDOWN = 0x00000100;
+    private const uint SERVICE_CONTROL_STOP = 1, SERVICE_CONTROL_SHUTDOWN = 5, SERVICE_CONTROL_PRESHUTDOWN = 15;
     private const uint ERROR_SERVICE_SPECIFIC_ERROR = 1066;
-    private enum ScriptMode { Initialize, Stop, SessionLogoff }
+    private enum ScriptMode { Initialize, Stop }
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct SERVICE_TABLE_ENTRY {
         [MarshalAs(UnmanagedType.LPWStr)] public string lpServiceName; public ServiceMainDelegate lpServiceProc;
@@ -37,10 +34,6 @@ internal static class CodexRelayLifecycle {
     private struct SERVICE_STATUS {
         public uint dwServiceType, dwCurrentState, dwControlsAccepted, dwWin32ExitCode;
         public uint dwServiceSpecificExitCode, dwCheckPoint, dwWaitHint;
-    }
-    [StructLayout(LayoutKind.Sequential)]
-    private struct WTSSESSION_NOTIFICATION {
-        public uint cbSize, dwSessionId;
     }
     [StructLayout(LayoutKind.Sequential)]
     private struct SERVICE_PRESHUTDOWN_INFO {
@@ -70,14 +63,11 @@ internal static class CodexRelayLifecycle {
     private static readonly object StatusGate = new object();
     private static readonly SemaphoreSlim ScriptGate = new SemaphoreSlim(1, 1);
     private static readonly ManualResetEvent Stopped = new ManualResetEvent(false);
-    private static readonly Queue<uint> PendingSessionIds = new Queue<uint>();
-    private static readonly HashSet<uint> ScheduledSessionIds = new HashSet<uint>();
     private static ServiceMainDelegate serviceMainRoot;
     private static HandlerExDelegate controlHandlerRoot;
     private static IntPtr serviceStatusHandle;
     private static uint checkpoint;
     private static bool stopRequested;
-    private static bool sessionWorkerRunning;
     public static void Main() {
         serviceMainRoot = ServiceMain;
         SERVICE_TABLE_ENTRY[] table = new SERVICE_TABLE_ENTRY[] {
@@ -135,15 +125,6 @@ internal static class CodexRelayLifecycle {
             RequestStop(control);
             return 0;
         }
-        if (control == SERVICE_CONTROL_SESSIONCHANGE && eventType == WTS_SESSION_LOGOFF && eventData != IntPtr.Zero) {
-            try {
-                WTSSESSION_NOTIFICATION notification = (WTSSESSION_NOTIFICATION)Marshal.PtrToStructure(eventData, typeof(WTSSESSION_NOTIFICATION));
-                if (notification.cbSize >= (uint)Marshal.SizeOf(typeof(WTSSESSION_NOTIFICATION))) {
-                    QueueSessionLogoff(notification.dwSessionId);
-                }
-            }
-            catch { }
-        }
         return 0;
     }
     private static void RequestStop(uint eventCode) {
@@ -151,8 +132,6 @@ internal static class CodexRelayLifecycle {
         lock (StateGate) {
             if (!stopRequested) {
                 stopRequested = true;
-                PendingSessionIds.Clear();
-                ScheduledSessionIds.Clear();
                 startWorker = true;
             }
         }
@@ -177,54 +156,12 @@ internal static class CodexRelayLifecycle {
             Stopped.Set();
         }
     }
-    private static void QueueSessionLogoff(uint sessionId) {
-        bool startWorker = false;
-        lock (StateGate) {
-            if (stopRequested) {
-                return;
-            }
-            if (ScheduledSessionIds.Count >= MaxPendingLogoffs || !ScheduledSessionIds.Add(sessionId)) {
-                return;
-            }
-            PendingSessionIds.Enqueue(sessionId);
-            if (!sessionWorkerRunning) {
-                sessionWorkerRunning = true;
-                startWorker = true;
-            }
-        }
-        if (startWorker) {
-            Thread worker = new Thread(SessionLogoffWorker);
-            worker.IsBackground = true;
-            worker.Start();
-        }
-    }
-    private static void SessionLogoffWorker() {
-        try {
-            while (true) {
-                uint sessionId;
-                lock (StateGate) {
-                    if (stopRequested || PendingSessionIds.Count == 0) {
-                        sessionWorkerRunning = false;
-                        return;
-                    }
-                    sessionId = PendingSessionIds.Dequeue();
-                }
-                WriteStatus((int)WTS_SESSION_LOGOFF, "session_logoff", -1, sessionId);
-                int exitCode = RunFixedScript(ScriptMode.SessionLogoff, sessionId, null);
-                WriteStatus((int)WTS_SESSION_LOGOFF, "session_logoff_complete", exitCode, sessionId);
-                lock (StateGate) { ScheduledSessionIds.Remove(sessionId); }
-            }
-        }
-        catch {
-            lock (StateGate) { sessionWorkerRunning = false; }
-        }
-    }
     private static int RunFixedScript(ScriptMode mode, uint sessionId, Action progress) {
         Stopwatch acquireTimer = Stopwatch.StartNew();
         while (!ScriptGate.Wait(250)) {
             if (progress != null) { progress(); }
             if (acquireTimer.ElapsedMilliseconds >= ScriptGateWaitMilliseconds) {
-                return -2;
+                return -3;
             }
         }
         Process child = null;
@@ -266,9 +203,6 @@ internal static class CodexRelayLifecycle {
     private static string BuildArguments(ScriptMode mode, uint sessionId) {
         string prefix = "-NoProfile -NonInteractive -WindowStyle Hidden -File \"" + ScriptPath + "\" -Mode ";
         if (mode == ScriptMode.Initialize) { return prefix + "Initialize"; } if (mode == ScriptMode.Stop) { return prefix + "Stop"; }
-        if (mode == ScriptMode.SessionLogoff) {
-            return prefix + "SessionLogoff -SessionId " + sessionId.ToString(CultureInfo.InvariantCulture);
-        }
         throw new InvalidOperationException();
     }
     private static bool IsExpectedSystemService() {
@@ -305,7 +239,7 @@ internal static class CodexRelayLifecycle {
         status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
         status.dwCurrentState = state;
         status.dwControlsAccepted = state == SERVICE_RUNNING
-            ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PRESHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE
+            ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PRESHUTDOWN
             : 0;
         status.dwWin32ExitCode = win32ExitCode;
         status.dwServiceSpecificExitCode = serviceExitCode;
@@ -327,6 +261,13 @@ internal static class CodexRelayLifecycle {
                 File.WriteAllText(StatusTempPath, json, new UTF8Encoding(false));
                 if (File.Exists(StatusPath)) { File.Replace(StatusTempPath, StatusPath, null); }
                 else { File.Move(StatusTempPath, StatusPath); }
+                // Startup must not erase the result of the last actual cleanup.
+                if (eventCode != 0) {
+                    string operationPath = InstallDirectory + @"\lifecycle-last-operation.json";
+                    File.WriteAllText(StatusTempPath, json, new UTF8Encoding(false));
+                    if (File.Exists(operationPath)) File.Replace(StatusTempPath, operationPath, null);
+                    else File.Move(StatusTempPath, operationPath);
+                }
             }
         }
         catch {

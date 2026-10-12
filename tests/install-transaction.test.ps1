@@ -6,7 +6,7 @@ $testRoot = Join-Path $PSScriptRoot ('.install-test-' + [Guid]::NewGuid().ToStri
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 $passed = 0
 try {
-    foreach ($case in @('late_failure','cleanup_failure','invalid_runtime','success')) {
+    foreach ($case in @('success','late_failure','cleanup_failure','invalid_runtime')) {
         $dir = Join-Path $testRoot $case
         $payload = Join-Path $dir 'payload'
         $install = Join-Path $dir 'install'
@@ -43,17 +43,26 @@ $userTaskName = 'fixture-user'
 $helperTaskName = 'fixture-helper'
 $serviceName = 'fixture-service'
 $script:tasks = @{}
+$script:actions = @{}
 $script:service = $null
 function Set-ProtectedDirectoryAcl { param($Directory,$UserSid,$UserWrite) }
 function Get-AuthenticodeSignature {
     param($LiteralPath)
     [pscustomobject]@{Status=$(if($case -eq 'invalid_runtime'){'NotSigned'}else{'Valid'});SignerCertificate=[pscustomobject]@{Subject='CN=Node.js, O=OpenJS Foundation'}}
 }
-function New-ScheduledTaskAction { param($Execute,$Argument,$WorkingDirectory); @{} }
+function New-ScheduledTaskAction {
+    # Match the Windows cmdlet: omit optional arguments, never pass an empty one.
+    param($Execute,[ValidateNotNullOrEmpty()][string]$Argument,$WorkingDirectory)
+    [pscustomobject]@{Execute=$Execute;Arguments=$Argument;WorkingDirectory=$WorkingDirectory}
+}
 function New-ScheduledTaskTrigger { param([switch]$AtLogOn,$User,[switch]$AtStartup,[switch]$Once,$At,$RepetitionInterval); @{} }
 function New-ScheduledTaskPrincipal { param($UserId,$LogonType,$RunLevel); @{} }
 function New-ScheduledTaskSettingsSet { param($MultipleInstances,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries,$ExecutionTimeLimit,[switch]$StartWhenAvailable); @{} }
-function Register-ScheduledTask { param($TaskName,$Action,$Trigger,$Principal,$Settings,$Description); $script:tasks[$TaskName]='Ready' }
+function Register-ScheduledTask {
+    param($TaskName,$Action,$Trigger,$Principal,$Settings,$Description)
+    $script:actions[$TaskName]=$Action
+    $script:tasks[$TaskName]='Ready'
+}
 function Start-ScheduledTask {
     param($TaskName)
     $script:tasks[$TaskName]='Running'
@@ -84,9 +93,9 @@ function New-FixtureScheduler {
 '@
         # Execute the transaction against temporary files and mocked OS boundaries.
         $fixtureBody = $body.Replace('$PSScriptRoot','$PayloadDirectory').Replace('& "$env:SystemRoot\System32\sc.exe"','Invoke-FixtureSc').Replace("New-Object -ComObject 'Schedule.Service'",'New-FixtureScheduler')
-        $suffix = @'
+$suffix = @'
 } catch { $failed=$true }
-@{failed=$failed;tasks=@($script:tasks.Keys);service=$script:service} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $dir 'observed.json') -Encoding UTF8
+@{failed=$failed;tasks=@($script:tasks.Keys);actions=$script:actions;service=$script:service} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $dir 'observed.json') -Encoding UTF8
 '@
         $fixture = Join-Path $dir 'entry.ps1'
         [IO.File]::WriteAllText($fixture,($prefix.Replace('__DIR__',$escaped).Replace('__CASE__',$case)+"`n`$failed=`$false`ntry {`n"+$fixtureBody+"`n"+$suffix),(New-Object Text.UTF8Encoding($true)))
@@ -107,6 +116,10 @@ function New-FixtureScheduler {
             $settings=Get-Content -LiteralPath (Join-Path $install 'settings.json') -Raw -Encoding UTF8 | ConvertFrom-Json
             if($settings.ownerName -ne 'fixture\用户' -or $settings.proxyPort -ne 8899){throw 'Unicode settings or proxyPort not preserved'}
             if($observed.service.StartType -ne 'Automatic'){throw 'Successful service not automatic'}
+            $userAction = $observed.actions.'fixture-user'
+            if($userAction.Execute -ne (Join-Path $install 'CodexRelayTrayHost.exe')){throw 'Successful user task must execute the fixed tray host'}
+            if([string]$userAction.Arguments -ne ''){throw 'Successful user task must have empty arguments'}
+            if($userAction.WorkingDirectory -ne $install){throw 'Successful user task must use the installation directory'}
         }
         $passed++
     }

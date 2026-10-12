@@ -24,7 +24,7 @@ function Test-StateProcess($State) {
     if (-not $candidate) { return $false }
     return [Math]::Abs(($candidate.StartTime.ToUniversalTime() - (Convert-ManagedUtc $State.startedAt)).TotalSeconds) -lt 10
 }
-function Get-EffectiveRelayStatus($State, $Helper, [bool]$Live, [bool]$OwnedMappingPresent, [DateTime]$NowUtc) {
+function Get-EffectiveRelayStatus($State, $Helper, [bool]$Live, [bool]$OwnedMappingPresent, [DateTime]$NowUtc, [string]$CleanupHealth = 'unknown') {
     if (-not $Live) {
         if ($OwnedMappingPresent) { return 'cleanup_pending' }
         return 'stopped'
@@ -33,7 +33,110 @@ function Get-EffectiveRelayStatus($State, $Helper, [bool]$Live, [bool]$OwnedMapp
     if ($State.status -ne 'ready') { return [string]$State.status }
     if (-not $Helper -or $Helper.status -ne 'mapped' -or $Helper.relayPid -ne $State.pid -or -not $OwnedMappingPresent) { return 'waiting_mapping' }
     if (($NowUtc - (Convert-ManagedUtc $Helper.updatedAtUtc)).TotalSeconds -gt 150) { return 'maintenance_stale' }
+    if ($CleanupHealth -in @('failed','incomplete','unverified','guard_unavailable')) { return 'ready_cleanup_warning' }
     return 'ready'
+}
+function Get-CleanupHealth($Operation, $Receipt, $SessionReceipt, $Guard) {
+    $serviceObservations = @()
+    if ($Operation -and [int]$Operation.eventCode -ne 0) {
+        $health = if ($Operation.status -eq 'stopped' -or $Operation.status -eq 'session_logoff_complete') {
+            if ([int]$Operation.exitCode -eq 0) { 'verified' } else { 'failed' }
+        } else { 'incomplete' }
+        $operationTime = if ($Operation.utc) { Convert-ManagedUtc $Operation.utc } else { $null }
+        $serviceObservations += [pscustomobject]@{time=$operationTime;health=$health;source='service';reason=('exit_' + $Operation.exitCode)}
+    }
+    if ($Receipt) {
+        $timestamp = if ($Receipt.completedAtUtc) { $Receipt.completedAtUtc } else { $Receipt.startedAtUtc }
+        if ($timestamp) {
+            $health = if (-not $Receipt.completedAtUtc) { 'incomplete' } elseif ($Receipt.success) { 'verified' } else { 'failed' }
+            $serviceObservations += [pscustomobject]@{time=(Convert-ManagedUtc $timestamp);health=$health;source='service_receipt';reason=$Receipt.reason}
+        }
+    }
+
+    # A v2 guard is the authority for user-session cleanup. Its current
+    # receipt is valid only when the process instance ids match. A stale or
+    # legacy receipt must never look like a successful current exit.
+    $guardObservation = $null
+    if ($null -ne $Guard) {
+        $guardInstanceId = [string]$Guard.instanceId
+        $sessionInstanceId = if ($SessionReceipt) { [string]$SessionReceipt.instanceId } else { '' }
+        $hasCurrentInstance = -not [string]::IsNullOrWhiteSpace($guardInstanceId)
+        $hasSessionInstance = -not [string]::IsNullOrWhiteSpace($sessionInstanceId)
+        if ($hasCurrentInstance -and $hasSessionInstance -and $sessionInstanceId -eq $guardInstanceId) {
+            $timestamp = if ($SessionReceipt.completedAtUtc) { $SessionReceipt.completedAtUtc } else { $SessionReceipt.startedAtUtc }
+            if ($timestamp) {
+                $health = if (-not $SessionReceipt.completedAtUtc) { 'incomplete' } elseif ($SessionReceipt.success) { 'verified' } else { 'failed' }
+                $guardObservation = [pscustomobject]@{time=(Convert-ManagedUtc $timestamp);health=$health;source='session_guard';reason=$SessionReceipt.reason;instanceId=$sessionInstanceId}
+            } else {
+                $guardObservation = [pscustomobject]@{time=$null;health='incomplete';source='session_guard';reason='session_receipt_missing_timestamp';instanceId=$sessionInstanceId}
+            }
+        } elseif ($SessionReceipt -and $hasCurrentInstance -and -not $hasSessionInstance) {
+            $timestamp = if ($SessionReceipt.completedAtUtc) { $SessionReceipt.completedAtUtc } else { $SessionReceipt.startedAtUtc }
+            $guardObservation = [pscustomobject]@{time=$(if ($timestamp) { Convert-ManagedUtc $timestamp } else { $null });health='unverified';source='session_guard';reason='session_receipt_instance_id_missing'}
+        } elseif (-not $hasCurrentInstance) {
+            # A status file from the old guard has no way to bind its receipt
+            # to a process. Treat it as an unverified previous exit.
+            $guardObservation = [pscustomobject]@{time=$null;health='unverified';source='session_guard';reason='guard_instance_id_missing'}
+        } elseif ($Guard.previousExit) {
+            $previous = $Guard.previousExit
+            $health = [string]$previous.health
+            if ($health -notin @('verified','failed','incomplete','unverified','unknown')) { $health = 'unverified' }
+            $timestamp = if ($previous.completedAtUtc) { $previous.completedAtUtc } else { $previous.observedAtUtc }
+            $guardObservation = [pscustomobject]@{time=$(if ($timestamp) { Convert-ManagedUtc $timestamp } else { $null });health=$health;source='guard_previous';reason=$previous.reason;instanceId=$previous.instanceId}
+        } else {
+            # A malformed v2 status is evidence that the previous exit could
+            # not be correlated. A valid first-run status carries unknown in
+            # previousExit and therefore does not take this branch.
+            $guardObservation = [pscustomobject]@{time=$null;health='unverified';source='guard_previous';reason='previous_exit_missing'}
+        }
+    }
+    if ($null -eq $Guard) {
+        $observations = @($serviceObservations)
+        if ($SessionReceipt) {
+            $timestamp = if ($SessionReceipt.completedAtUtc) { $SessionReceipt.completedAtUtc } else { $SessionReceipt.startedAtUtc }
+            if ($timestamp) {
+                $health = if (-not $SessionReceipt.completedAtUtc) { 'incomplete' } elseif ($SessionReceipt.success) { 'verified' } else { 'failed' }
+                $observations += [pscustomobject]@{time=(Convert-ManagedUtc $timestamp);health=$health;source='session_guard';reason=$SessionReceipt.reason}
+            }
+        }
+        $latest = $observations | Sort-Object time -Descending | Select-Object -First 1
+        if ($latest) { return $latest }
+        return [pscustomobject]@{time=$null;health='unknown';source=$null;reason='no_cleanup_receipt'}
+    }
+
+    if ($guardObservation) {
+        # A verified service receipt is not proof that the user guard cleaned
+        # up this instance. A later service failure remains actionable, even
+        # when the guard has a successful or unverified previous-exit record.
+        foreach ($service in $serviceObservations) {
+            $newer = (-not $guardObservation.time) -or ($service.time -and $service.time -gt $guardObservation.time)
+            if ($newer -and $service.health -in @('failed','incomplete')) {
+                $guardObservation = $service
+            }
+        }
+        return $guardObservation
+    }
+    if ($serviceObservations) {
+        return ($serviceObservations | Sort-Object time -Descending | Select-Object -First 1)
+    }
+    return [pscustomobject]@{time=$null;health='unknown';source=$null;reason='no_cleanup_receipt'}
+}
+function Test-SessionGuardAlive($Guard) {
+    if (-not $Guard -or -not $Guard.pid -or -not $Guard.windowHandle -or -not $Guard.prioritySet) { return $false }
+    try {
+        $process = Get-Process -Id ([int]$Guard.pid) -ErrorAction Stop
+        if (-not ('RelaySessionGuard' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'RelaySessionGuard.dll') }
+        return [Math]::Abs(($process.StartTime.ToUniversalTime() - (Convert-ManagedUtc $Guard.processStartedAtUtc)).TotalSeconds) -lt 1 -and [RelaySessionGuard]::IsWindowForProcess([long]$Guard.windowHandle,[int]$Guard.pid)
+    } catch { return $false }
+}
+function Test-ManagedTaskStopped([string]$TaskName) {
+    try {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        return [string]$task.State -ne 'Running'
+    } catch {
+        # A removed task cannot be holding the tray host open.
+        return $true
+    }
 }
 function Stop-Relay {
     $state = Read-State
@@ -41,25 +144,38 @@ function Stop-Relay {
     if (Test-Path -LiteralPath $settings.stateDirectory) {
         @{pid=$requestedPid;requestedAt=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $settings.stateDirectory 'stop.json') -Encoding ASCII
     }
-    if (Test-StateProcess $state) {
-        $deadline = (Get-Date).AddSeconds(25)
-        do {
-            Start-Sleep -Milliseconds 300
-            $state = Read-State
-            if ($state.status -eq 'stopped') { break }
-        } while ((Get-Date) -lt $deadline)
-        if ($state.status -ne 'stopped') { throw 'The relay did not confirm a clean stop. Inspect Status; no unrelated process was killed.' }
-    }
-    Stop-ScheduledTask -TaskName $userTaskName -ErrorAction SilentlyContinue
-    Start-ScheduledTask -TaskName $helperTaskName
+    $relayWasAlive = Test-StateProcess $state
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    $relayStopped = -not $relayWasAlive
+    $taskStopped = Test-ManagedTaskStopped $userTaskName
+    do {
+        $state = Read-State
+        $relayExited = -not (Test-StateProcess $state)
+        $relayStopped = (-not $relayWasAlive) -or ($relayExited -and (-not $state -or $state.status -eq 'stopped'))
+        $taskStopped = Test-ManagedTaskStopped $userTaskName
+        if ($relayStopped -and $taskStopped) { break }
+        Start-Sleep -Milliseconds 300
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (-not $relayStopped) { throw 'Relay stop request timed out waiting for the relay to exit cleanly; the tray host was left running for retry.' }
+    if (-not $taskStopped) { throw 'Relay stop request timed out waiting for the tray host task to exit; it was left running for retry.' }
+
+    # The launcher normally starts maintenance in its finally block. Trigger
+    # it only after the tray host has exited, so its cleanup cannot race the
+    # guard's natural shutdown.
+    try {
+        $helperTask = Get-ScheduledTask -TaskName $helperTaskName -ErrorAction Stop
+        if ([string]$helperTask.State -ne 'Running') { Start-ScheduledTask -TaskName $helperTaskName -ErrorAction SilentlyContinue }
+    } catch { }
     # Cleanup is asynchronous; verify the observable hosts result before claiming success.
-    $deadline = (Get-Date).AddSeconds(15)
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
     $hostsFile = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     do {
-        if ([IO.File]::ReadAllText($hostsFile) -notmatch 'CODEX-DURABLE-RELAY-V2') { return }
+        try {
+            if ([IO.File]::ReadAllText($hostsFile) -notmatch 'CODEX-DURABLE-RELAY-V2') { return }
+        } catch { }
         Start-Sleep -Milliseconds 300
-    } while ((Get-Date) -lt $deadline)
-    throw 'Relay stopped but hosts cleanup is not confirmed. Inspect Status or run the protected cleanup as administrator.'
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Relay and tray host exited, but hosts cleanup did not finish before the deadline; no task was killed, so inspect Status and retry.'
 }
 
 if ($Action -in @('EnableAutostart','DisableAutostart','Uninstall') -and -not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -102,11 +218,20 @@ switch ($Action) {
         $effectiveStatus = Get-EffectiveRelayStatus $state $helper $live $ownedMappingPresent ([DateTime]::UtcNow)
         $lifecycle = Get-Service -Name 'CodexDurableRelayLifecycle' -ErrorAction SilentlyContinue
         $cleanup = try { Get-Content -LiteralPath (Join-Path $PSScriptRoot 'lifecycle-cleanup-result.json') -Raw | ConvertFrom-Json } catch { $null }
+        $operation = try { Get-Content -LiteralPath (Join-Path $PSScriptRoot 'lifecycle-last-operation.json') -Raw | ConvertFrom-Json } catch { $null }
+        if (-not $operation) { $operation = try { Get-Content -LiteralPath (Join-Path $PSScriptRoot 'lifecycle-service-status.json') -Raw | ConvertFrom-Json } catch { $null } }
+        $sessionReceipt = try { Get-Content -LiteralPath (Join-Path $settings.stateDirectory 'session-end-result.json') -Raw | ConvertFrom-Json } catch { $null }
+        $guard = try { Get-Content -LiteralPath (Join-Path $settings.stateDirectory 'session-guard-status.json') -Raw | ConvertFrom-Json } catch { $null }
+        $guardAlive = Test-SessionGuardAlive $guard
+        $cleanupHealth = Get-CleanupHealth $operation $cleanup $sessionReceipt $guard
+        $health = if ($live -and -not $guardAlive) { 'guard_unavailable' } else { $cleanupHealth.health }
+        $effectiveStatus = Get-EffectiveRelayStatus $state $helper $live $ownedMappingPresent ([DateTime]::UtcNow) $health
         if ($effectiveStatus -eq 'ready' -and (-not $lifecycle -or $lifecycle.Status -ne 'Running')) { $effectiveStatus = 'lifecycle_unavailable' }
-        $result = [ordered]@{ status=$effectiveStatus; loginAutostart=(@($task.Triggers | Where-Object Enabled).Count -gt 0); taskState=[string]$task.State; processAlive=$live; relay=$state; hostsMaintenance=$helper; lifecycleService=[string]$lifecycle.Status; lastLifecycleCleanup=$cleanup; note='TLS readiness does not prove authenticated WebSocket or message delivery.' }
+        $result = [ordered]@{ status=$effectiveStatus; loginAutostart=(@($task.Triggers | Where-Object Enabled).Count -gt 0); taskState=[string]$task.State; processAlive=$live; relay=$state; hostsMaintenance=$helper; lifecycleService=[string]$lifecycle.Status; lastLifecycleCleanup=$cleanup; lastLifecycleOperation=$operation; sessionGuardAlive=$guardAlive; sessionGuardStatus=$guard; previousExit=$(if ($guard) { $guard.previousExit } else { $null }); lastSessionCleanup=$sessionReceipt; cleanupHealth=$cleanupHealth; note='TLS readiness does not prove authenticated WebSocket or message delivery.' }
         if ($AsJson) { $result | ConvertTo-Json -Depth 8 } else {
             $statusText = switch ($effectiveStatus) {
                 'ready' { '已启用，TLS 检查通过' }
+                'ready_cleanup_warning' { if ($cleanupHealth.health -eq 'unverified') { '网络已启用，但上次运行退出清理未确认，请检查下方记录' } else { '网络已启用，但退出清理有异常，请检查下方记录' } }
                 'waiting_proxy' { '等待 Clash 或上游连接恢复' }
                 'degraded' { '连接异常，正在等待恢复' }
                 'waiting_mapping' { '正在等待域名映射；若持续出现，请查看维护状态' }
@@ -121,6 +246,9 @@ switch ($Action) {
             Write-Output ('状态：' + $statusText)
             Write-Output ('登录自动启动：' + $(if ($result.loginAutostart) { '已启用' } else { '已关闭' }))
             Write-Output ('关机清理服务：' + $(if ($lifecycle.Status -eq 'Running') { '运行中' } else { '未运行' }))
+            Write-Output ('用户会话退出保护：' + $(if ($guardAlive) { '运行中' } else { '未运行' }))
+            Write-Output ('最近退出清理：' + $cleanupHealth.health + ' / ' + $cleanupHealth.reason)
+            if ($cleanupHealth.time) { Write-Output ('清理记录时间：' + $cleanupHealth.time.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')) }
             if ($state.tlsVerifiedAt) { Write-Output ('最近 TLS 检查成功：' + (Convert-ManagedUtc $state.tlsVerifiedAt).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')) }
             if ($helper.status -eq 'error') { Write-Output ('维护异常：' + $helper.reason) }
             Write-Output ('诊断记录：' + $settings.stateDirectory)

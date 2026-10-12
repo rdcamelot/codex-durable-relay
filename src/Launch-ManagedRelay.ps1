@@ -31,7 +31,7 @@ foreach ($name in @('NODE_OPTIONS','NODE_PATH','NODE_EXTRA_CA_CERTS','NODE_TLS_R
     [Environment]::SetEnvironmentVariable($name, $null, 'Process')
 }
 $code = 1
-$launchStarted = [DateTime]::UtcNow
+$launchStarted = (Get-Process -Id $PID).StartTime.ToUniversalTime()
 function Test-UserStopRequested {
     if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'shutdown-request.flag')) { return $true }
     try {
@@ -42,8 +42,16 @@ function Test-UserStopRequested {
 for ($attempt = 0; $attempt -le 3; $attempt++) {
     if (Test-UserStopRequested) { $code = 0; break }
     try {
-        $process = Start-Process -FilePath (Join-Path $PSScriptRoot 'node.exe') -ArgumentList ('"' + (Join-Path $PSScriptRoot 'managed-relay.cjs') + '" --run') -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -Wait -PassThru
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = Join-Path $PSScriptRoot 'node.exe'
+        $startInfo.Arguments = '"' + (Join-Path $PSScriptRoot 'managed-relay.cjs') + '" --run'
+        $startInfo.WorkingDirectory = $PSScriptRoot
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $process = [Diagnostics.Process]::Start($startInfo)
+        $process.WaitForExit()
         $code = $process.ExitCode
+        $process.Dispose()
     } finally {
         Start-ScheduledTask -TaskName 'Codex Durable Relay - Hosts' -ErrorAction SilentlyContinue
     }
